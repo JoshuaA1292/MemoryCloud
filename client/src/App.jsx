@@ -66,6 +66,10 @@ function getMemoryPosition(memory) {
   return seededPosition(memory._id || memory.text || 'seed');
 }
 
+function getDisplayPosition(memory) {
+  return getMemoryPosition(memory).add(moodAnchor(memory.mood).multiplyScalar(0.6));
+}
+
 function StarNode({ mem, isSelected, onSelect, density = 0 }) {
   const meshRef = useRef();
   useFrame(({ clock }) => {
@@ -77,18 +81,29 @@ function StarNode({ mem, isSelected, onSelect, density = 0 }) {
   });
 
   return (
-    <mesh
-      ref={meshRef}
+    <group
       position={mem.position}
       onClick={(e) => {
         e.stopPropagation();
         onSelect(mem);
       }}
+      onPointerOver={() => {
+        document.body.style.cursor = 'pointer';
+      }}
+      onPointerOut={() => {
+        document.body.style.cursor = '';
+      }}
     >
-      <sphereGeometry args={[isSelected ? 0.9 : 0.55, 24, 24]} />
-      <meshBasicMaterial color={mem.color} toneMapped={false} />
-      <pointLight distance={16} intensity={(isSelected ? 3 : 1.4) + Math.min(density, 6) * 0.18} color={mem.color} />
-    </mesh>
+      <mesh ref={meshRef}>
+        <sphereGeometry args={[isSelected ? 1.05 : 0.7, 24, 24]} />
+        <meshBasicMaterial color={mem.color} toneMapped={false} />
+        <pointLight distance={16} intensity={(isSelected ? 3 : 1.4) + Math.min(density, 6) * 0.18} color={mem.color} />
+      </mesh>
+      <mesh>
+        <sphereGeometry args={[2.2, 10, 10]} />
+        <meshBasicMaterial transparent opacity={0} depthWrite={false} />
+      </mesh>
+    </group>
   );
 }
 
@@ -240,7 +255,7 @@ function LinkArcs({ links, nodesById, selectedId }) {
 function LivingCartography({ memories, onSelect, selectedId, showLabels, links, linkCounts }) {
   const safeMemories = useMemo(() => {
     return memories.map((m) => {
-      const pos = getMemoryPosition(m).add(moodAnchor(m.mood).multiplyScalar(0.6));
+      const pos = getDisplayPosition(m);
       const mood = normalizeMood(m.mood);
       let color = m.color || '#ffffff';
       if (!m.color) {
@@ -361,6 +376,7 @@ export default function App() {
   const [familyBrief, setFamilyBrief] = useState(null);
   const [familyBriefStatus, setFamilyBriefStatus] = useState('idle');
   const [selectedFamily, setSelectedFamily] = useState('NONE');
+  const [memoryQuery, setMemoryQuery] = useState('');
 
   const controlsRef = useRef();
   const toastTimerRef = useRef(null);
@@ -381,8 +397,8 @@ export default function App() {
 
   useEffect(() => {
     if (selectedMemory && controlsRef.current) {
-      const pos = getMemoryPosition(selectedMemory);
-      const offset = new THREE.Vector3(0, 0.35, 1).normalize().multiplyScalar(18);
+      const pos = getDisplayPosition(selectedMemory);
+      const offset = new THREE.Vector3(0, 0.2, 1).normalize().multiplyScalar(18);
       controlsRef.current.setLookAt(
         pos.x + offset.x,
         pos.y + offset.y,
@@ -584,6 +600,42 @@ export default function App() {
     }
   }, [filteredMemories, selectedMemory]);
 
+  const navigableMemories = useMemo(() => {
+    const query = memoryQuery.trim().toLowerCase();
+    const sorted = [...filteredMemories].sort((a, b) => {
+      const aTime = new Date(a.createdAt).getTime();
+      const bTime = new Date(b.createdAt).getTime();
+      return bTime - aTime;
+    });
+    if (!query) return sorted;
+    return sorted.filter((mem) => {
+      const text = (mem.text || '').toLowerCase();
+      const mood = (mem.mood || '').toLowerCase();
+      const tags = Array.isArray(mem.tags) ? mem.tags.join(' ').toLowerCase() : '';
+      return text.includes(query) || mood.includes(query) || tags.includes(query);
+    });
+  }, [filteredMemories, memoryQuery]);
+
+  const selectedIndex = useMemo(
+    () => navigableMemories.findIndex((mem) => mem._id === selectedMemory?._id),
+    [navigableMemories, selectedMemory]
+  );
+
+  const handleStepSelection = useCallback(
+    (direction) => {
+      if (!navigableMemories.length) return;
+      let nextIndex = selectedIndex;
+      if (nextIndex === -1) {
+        nextIndex = direction > 0 ? 0 : navigableMemories.length - 1;
+      } else {
+        nextIndex = (nextIndex + direction + navigableMemories.length) % navigableMemories.length;
+      }
+      setSelectedMemory(navigableMemories[nextIndex]);
+      setActiveView('CONSTELLATION');
+    },
+    [navigableMemories, selectedIndex]
+  );
+
   return (
     <div className="v8-shell">
       <div className="v8-canvas">
@@ -737,6 +789,46 @@ export default function App() {
                 onChange={(e) => setTimeScrub(Number(e.target.value))}
               />
               <div className="v8-console-date">{formattedScrubDate}</div>
+            </div>
+            <div className="v8-navigator">
+              <div className="v8-navigator-header">
+                <div>
+                  <div className="v8-panel-label">Navigator</div>
+                  <div className="v8-navigator-title">Jump between stories</div>
+                </div>
+                <div className="v8-navigator-controls">
+                  <button className="v8-link-btn" onClick={() => handleStepSelection(-1)}>
+                    Prev
+                  </button>
+                  <button className="v8-link-btn" onClick={() => handleStepSelection(1)}>
+                    Next
+                  </button>
+                </div>
+              </div>
+              <input
+                className="v8-search"
+                type="search"
+                placeholder="Search memory, mood, tag..."
+                value={memoryQuery}
+                onChange={(event) => setMemoryQuery(event.target.value)}
+              />
+              <div className="v8-nav-list">
+                {navigableMemories.slice(0, 18).map((mem) => (
+                  <button
+                    key={mem._id}
+                    className={`v8-nav-item ${selectedMemory?._id === mem._id ? 'is-active' : ''}`}
+                    onClick={() => setSelectedMemory(mem)}
+                  >
+                    <div className="v8-nav-title">{normalizeMood(mem.mood)}</div>
+                    <div className="v8-nav-text">
+                      {mem.text?.length > 80 ? `${mem.text.slice(0, 80)}…` : mem.text}
+                    </div>
+                  </button>
+                ))}
+                {!navigableMemories.length && (
+                  <div className="v8-nav-empty">No memories match this filter.</div>
+                )}
+              </div>
             </div>
             {!memories.length && (
               <div className="v8-empty">
