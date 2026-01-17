@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import * as THREE from 'three';
+import { API_BASE } from './lib/api';
 
 function seededPosition(seed) {
   let hash = 0;
@@ -34,7 +35,7 @@ export const useStore = create((set, get) => ({
   // ACTIONS
   fetchArchive: async () => {
     try {
-      const res = await fetch('http://127.0.0.1:8080/api/memories');
+      const res = await fetch(`${API_BASE}/memories`);
       const data = await res.json();
       
       // PROCESS DATA: Map MongoDB to 3D Space

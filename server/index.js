@@ -7,10 +7,31 @@ const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const MONGO_URI = process.env.MONGO_URI;
+
+if (!MONGO_URI) {
+  console.error('❌ Missing MONGO_URI environment variable');
+  process.exit(1);
+}
+
+const allowedOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const corsOptions = allowedOrigins.length
+  ? {
+      origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) {
+          return callback(null, true);
+        }
+        return callback(new Error('Not allowed by CORS'));
+      }
+    }
+  : { origin: true };
 
 // MIDDLEWARE
 app.use(express.json());
-app.use(cors());
+app.use(cors(corsOptions));
 
 app.use((req, res, next) => {
   console.log(`🔔 Request received: ${req.method} ${req.url}`);
@@ -27,7 +48,7 @@ const linksRoute = require('./routes/links');
 const connectDB = async () => {
   try {
     // 1. Attempt to connect
-    const conn = await mongoose.connect(process.env.MONGO_URI);
+    const conn = await mongoose.connect(MONGO_URI);
     
     // 2. Success message
     // conn.connection.host tells us exactly which server we reached

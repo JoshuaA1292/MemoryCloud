@@ -3,6 +3,7 @@ import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Billboard, CameraControls, Line, Sparkles, Stars, Text } from '@react-three/drei';
 import { EffectComposer, Bloom, Noise, Vignette, ChromaticAberration } from '@react-three/postprocessing';
 import * as THREE from 'three';
+import { API_BASE } from './lib/api';
 
 const promptSeeds = [
   'A memory that still vibrates in my body is...',
@@ -363,21 +364,20 @@ export default function App() {
 
   const controlsRef = useRef();
   const toastTimerRef = useRef(null);
-  const apiBase = 'http://127.0.0.1:8080/api';
 
   useEffect(() => {
-    fetch(`${apiBase}/memories`)
+    fetch(`${API_BASE}/memories`)
       .then((res) => res.json())
       .then((data) => setMemories(data))
       .catch((err) => console.error('Database Offline', err));
-  }, [apiBase]);
+  }, []);
 
   useEffect(() => {
-    fetch(`${apiBase}/links`)
+    fetch(`${API_BASE}/links`)
       .then((res) => (res.ok ? res.json() : []))
       .then((data) => setLinks(Array.isArray(data) ? data : []))
       .catch((err) => console.error('Linking Offline', err));
-  }, [apiBase, memories.length]);
+  }, [memories.length]);
 
   useEffect(() => {
     if (selectedMemory && controlsRef.current) {
@@ -469,7 +469,7 @@ export default function App() {
     setFamilyBriefStatus('loading');
     setFamilyBrief(null);
     try {
-      const res = await fetch(`${apiBase}/memories/family/brief`, {
+      const res = await fetch(`${API_BASE}/memories/family/brief`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mood })
@@ -499,7 +499,7 @@ export default function App() {
     if (!inputText.trim()) return;
     setIsProcessing(true);
     try {
-      const res = await fetch(`${apiBase}/memories`, {
+      const res = await fetch(`${API_BASE}/memories`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: inputText, location: 'Web' })
