@@ -8,6 +8,54 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
 const embeddingModel = genAI.getGenerativeModel({ model: "text-embedding-004" });
 
+// RATE LIMIT TRACKING
+let requestCount = 0;
+let rateLimitResetTime = Date.now() + 60000; // Reset every minute
+
+function checkRateLimit() {
+  const now = Date.now();
+  if (now >= rateLimitResetTime) {
+    requestCount = 0;
+    rateLimitResetTime = now + 60000;
+  }
+  
+  if (requestCount >= 14) { // Stay under 15/min limit
+    return false;
+  }
+  
+  requestCount++;
+  return true;
+}
+
+// OFFLINE MODE FALLBACK
+const OFFLINE_MOODS = [
+  { name: 'Memory', color: '#9CA3AF' },
+  { name: 'Reflection', color: '#60A5FA' },
+  { name: 'Longing', color: '#A78BFA' },
+  { name: 'Quiet Joy', color: '#34D399' },
+  { name: 'Tension', color: '#F87171' },
+  { name: 'Relief', color: '#FBBF24' },
+  { name: 'Grief', color: '#6B7280' },
+  { name: 'Wonder', color: '#EC4899' }
+];
+
+function getOfflineMood() {
+  const random = OFFLINE_MOODS[Math.floor(Math.random() * OFFLINE_MOODS.length)];
+  return {
+    mood: random.name,
+    tags: ['Offline', 'Auto-classified'],
+    color: random.color,
+    themeVector: {
+      emotionalCore: [{ label: 'memory', weight: 1 }],
+      narrativeState: [{ label: 'unfinished', weight: 1 }],
+      relationalFocus: [{ label: 'self', weight: 1 }],
+      temporalOrientation: [{ label: 'memory', weight: 1 }],
+      spatialIntimacy: [{ label: 'private', weight: 1 }]
+    },
+    offlineMode: true
+  };
+}
+
 // HELPER: Clean JSON from AI
 function cleanAIResponse(text) {
   let clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -74,11 +122,20 @@ function isValidEmbedding(embedding) {
 }
 
 async function embedText(text) {
+  if (!checkRateLimit()) {
+    console.warn("⚠️ Rate limit reached, skipping embedding");
+    return [0, 0, 0];
+  }
+  
   try {
     const result = await embeddingModel.embedContent(text);
     const values = result?.embedding?.values;
     if (isValidEmbedding(values)) return values;
   } catch (error) {
+    if (error.message?.includes('quota') || error.message?.includes('limit')) {
+      console.warn("⚠️ Rate limit hit during embedding:", error.message);
+      return [0, 0, 0];
+    }
     console.error("Embedding Error:", error);
   }
   return [0, 0, 0];
@@ -216,6 +273,11 @@ function scoreFamilyMatch(candidate, family) {
 }
 
 async function proposeNewFamilyName(text, existingFamilies) {
+  if (!checkRateLimit()) {
+    console.warn("⚠️ Rate limit reached, using offline mode");
+    return null;
+  }
+  
   const prompt = `You are naming a new emotional family for a personal story.
 
 Existing families:
@@ -236,6 +298,10 @@ Return ONLY valid JSON:
     const mood = typeof parsed?.mood === 'string' ? parsed.mood.trim() : '';
     return mood || null;
   } catch (error) {
+    if (error.message?.includes('quota') || error.message?.includes('limit')) {
+      console.warn("⚠️ Rate limit hit during family naming");
+      return null;
+    }
     console.error("New Family Naming Error:", error);
     return null;
   }
@@ -243,6 +309,11 @@ Return ONLY valid JSON:
 
 async function broadenMoodName(mood, existingFamilies) {
   if (!mood || typeof mood !== 'string') return null;
+  if (!checkRateLimit()) {
+    console.warn("⚠️ Rate limit reached, skipping mood broadening");
+    return null;
+  }
+  
   const prompt = `You are refining an emotional family name to be broader and more archetypal.
 
 Current family name:
@@ -270,6 +341,10 @@ Return ONLY valid JSON:
     if (!nextMood) return null;
     return nextMood;
   } catch (error) {
+    if (error.message?.includes('quota') || error.message?.includes('limit')) {
+      console.warn("⚠️ Rate limit hit during mood broadening");
+      return null;
+    }
     console.error("Broaden Mood Error:", error);
     return null;
   }
@@ -320,7 +395,7 @@ router.get('/families', async (req, res) => {
   }
 });
 
-// POST (INGEST) - CONTEXT-AWARE CLASSIFICATION
+// POST (INGEST) - CONTEXT-AWARE CLASSIFICATION WITH RATE LIMIT HANDLING
 router.post('/', async (req, res) => {
   try {
     const { text, voiceNoteUrl, metadata } = req.body;
@@ -333,8 +408,17 @@ router.post('/', async (req, res) => {
     const existingFamilies = await Memory.distinct('mood');
     console.log("📚 Existing families:", existingFamilies);
 
-    // CONTEXT-AWARE PROMPT
-    const prompt = `Analyze this personal story for emotional classification: "${text}"
+    let analysis;
+    let offlineMode = false;
+
+    // CHECK RATE LIMIT BEFORE AI CALL
+    if (!checkRateLimit()) {
+      console.warn("🔴 OFFLINE MODE: Rate limit reached");
+      analysis = getOfflineMood();
+      offlineMode = true;
+    } else {
+      // CONTEXT-AWARE PROMPT
+      const prompt = `Analyze this personal story for emotional classification: "${text}"
 
 ${existingFamilies.length > 0 ? `
 EXISTING MOOD FAMILIES in the archive:
@@ -371,18 +455,24 @@ Return ONLY valid JSON:
   }
 }`;
 
-    const result = await model.generateContent(prompt);
-    const rawText = result.response.text();
-    
-    let analysis;
-    try {
-      const jsonStr = cleanAIResponse(rawText);
-      analysis = JSON.parse(jsonStr);
-      console.log("🎨 AI Classification:", analysis.mood);
-      console.log("💭 Reasoning:", analysis.reasoning);
-    } catch (parseError) {
-      console.error("AI Parse Error:", parseError, "\nRaw:", rawText);
-      analysis = { mood: "Memory", tags: ["Raw", "Unsorted"], color: "#CCCCCC" };
+      try {
+        const result = await model.generateContent(prompt);
+        const rawText = result.response.text();
+        
+        const jsonStr = cleanAIResponse(rawText);
+        analysis = JSON.parse(jsonStr);
+        console.log("🎨 AI Classification:", analysis.mood);
+        console.log("💭 Reasoning:", analysis.reasoning);
+      } catch (parseError) {
+        if (parseError.message?.includes('quota') || parseError.message?.includes('limit')) {
+          console.warn("🔴 OFFLINE MODE: Rate limit hit during classification");
+          analysis = getOfflineMood();
+          offlineMode = true;
+        } else {
+          console.error("AI Parse Error:", parseError);
+          analysis = { mood: "Memory", tags: ["Raw", "Unsorted"], color: "#CCCCCC" };
+        }
+      }
     }
 
     const normalized = normalizeAnalysis(analysis);
@@ -392,9 +482,9 @@ Return ONLY valid JSON:
 
     let finalMood = normalized.mood;
     let isNewFamily = false;
-    let clusterDecision = { decidedBy: 'ai', bestMatch: null, bestScore: null };
+    let clusterDecision = { decidedBy: offlineMode ? 'offline' : 'ai', bestMatch: null, bestScore: null };
 
-    if (existingFamilies.length > 0) {
+    if (!offlineMode && existingFamilies.length > 0) {
       const sampleMemories = await Memory.find({ mood: { $in: existingFamilies } })
         .select('mood embedding themeVector tags')
         .sort({ createdAt: -1 })
@@ -446,7 +536,7 @@ Return ONLY valid JSON:
       }
     }
 
-    if (isNewFamily) {
+    if (!offlineMode && isNewFamily) {
       const broadened = await broadenMoodName(finalMood, existingFamilies);
       if (broadened && broadened !== finalMood) {
         finalMood = broadened;
@@ -472,13 +562,19 @@ Return ONLY valid JSON:
     if (!existingFamilies.length) {
       isNewFamily = true;
     }
-    console.log(isNewFamily ? "🌟 NEW FAMILY CREATED:" : "✅ Added to existing family:", finalMood);
+    
+    if (offlineMode) {
+      console.log("🔴 OFFLINE MODE:", finalMood);
+    } else {
+      console.log(isNewFamily ? "🌟 NEW FAMILY CREATED:" : "✅ Added to existing family:", finalMood);
+    }
     
     res.json({
       ...newMemory.toObject(),
       isNewFamily,
-      reasoning: analysis.reasoning,
-      clusterDecision
+      reasoning: analysis.reasoning || 'Classified in offline mode due to rate limiting',
+      clusterDecision,
+      offlineMode
     });
 
   } catch (error) {
@@ -496,6 +592,12 @@ router.post('/family/brief', async (req, res) => {
     const memories = await Memory.find({ mood }).limit(10);
     if (!memories.length) {
       return res.status(404).json({ error: "No memories found for this mood" });
+    }
+
+    if (!checkRateLimit()) {
+      return res.status(429).json({ 
+        error: "Rate limit reached. Please wait a moment and try again." 
+      });
     }
 
     const storySample = memories.slice(0, 3).map(m => m.text).join(' ... ');
@@ -530,6 +632,11 @@ Return ONLY valid JSON:
     });
     
   } catch (e) {
+    if (e.message?.includes('quota') || e.message?.includes('limit')) {
+      return res.status(429).json({ 
+        error: "Rate limit reached. Please wait a moment and try again." 
+      });
+    }
     console.error("Family Brief Error:", e);
     res.status(500).json({ error: "Brief generation failed" });
   }
@@ -541,6 +648,12 @@ router.post('/competition/brief', async (req, res) => {
     const { memoryId } = req.body;
     const memory = await Memory.findById(memoryId);
     if (!memory) return res.status(404).json({ error: "Memory not found" });
+    
+    if (!checkRateLimit()) {
+      return res.status(429).json({ 
+        error: "Rate limit reached. Please wait a moment and try again." 
+      });
+    }
     
     const prompt = `Create a filmmaker's brief for this personal story: "${memory.text}"
 
@@ -563,6 +676,11 @@ Return ONLY valid JSON:
     res.json(brief);
     
   } catch (e) {
+    if (e.message?.includes('quota') || e.message?.includes('limit')) {
+      return res.status(429).json({ 
+        error: "Rate limit reached. Please wait a moment and try again." 
+      });
+    }
     console.error("Competition Brief Error:", e);
     res.status(500).json({ error: "Brief Failed" });
   }
