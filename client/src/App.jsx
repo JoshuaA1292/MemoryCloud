@@ -813,7 +813,7 @@ export default function App() {
                 onChange={(event) => setMemoryQuery(event.target.value)}
               />
               <div className="v8-nav-list">
-                {navigableMemories.slice(0, 18).map((mem) => (
+                {navigableMemories.map((mem) => (
                   <button
                     key={mem._id}
                     className={`v8-nav-item ${selectedMemory?._id === mem._id ? 'is-active' : ''}`}

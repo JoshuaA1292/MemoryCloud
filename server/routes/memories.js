@@ -707,6 +707,13 @@ router.post('/:id/links', async (req, res) => {
 
 // BACKGROUND RE-CLASSIFICATION WORKER
 let isReprocessing = false;
+let reprocessStats = {
+  lastRun: null,
+  totalProcessed: 0,
+  successCount: 0,
+  failCount: 0,
+  remainingOffline: 0
+};
 
 async function reprocessOfflineMemories() {
   if (isReprocessing) {
@@ -716,18 +723,31 @@ async function reprocessOfflineMemories() {
 
   try {
     isReprocessing = true;
+    reprocessStats.lastRun = new Date();
     
-    // Find up to 10 memories that were auto-classified in offline mode
-    const offlineMemories = await Memory.find({ tags: 'offline' })
+    // Find memories with 'offline' OR 'auto-classified' tags (case-insensitive)
+    const offlineMemories = await Memory.find({ 
+      $or: [
+        { tags: { $regex: /^offline$/i } },
+        { tags: { $regex: /^auto-classified$/i } }
+      ]
+    })
       .sort({ createdAt: 1 }) // Oldest first
       .limit(10);
+
+    reprocessStats.remainingOffline = await Memory.countDocuments({
+      $or: [
+        { tags: { $regex: /^offline$/i } },
+        { tags: { $regex: /^auto-classified$/i } }
+      ]
+    });
 
     if (!offlineMemories.length) {
       console.log("✅ No offline memories to reprocess");
       return;
     }
 
-    console.log(`🔄 Found ${offlineMemories.length} offline memories to reprocess`);
+    console.log(`🔄 Found ${offlineMemories.length} offline memories to reprocess (${reprocessStats.remainingOffline} total remaining)`);
 
     for (const memory of offlineMemories) {
       // Check rate limit before each memory
@@ -829,21 +849,26 @@ Return ONLY valid JSON:
           }
         }
 
-        // Update the memory
+        // Update the memory - REMOVE offline/auto-classified tags
         memory.mood = finalMood;
-        memory.tags = normalized.tags; // Remove 'offline' tag
+        memory.tags = normalized.tags.filter(tag => 
+          tag.toLowerCase() !== 'offline' && 
+          tag.toLowerCase() !== 'auto-classified'
+        );
         memory.color = normalized.color;
         memory.themeVector = themeVector;
         memory.embedding = embedding;
         
         await memory.save();
 
-        console.log(`✅ Reprocessed → ${finalMood}`);
+        reprocessStats.successCount++;
+        console.log(`✅ Reprocessed → ${finalMood} (${reprocessStats.successCount} done)`);
 
         // Small delay between memories to be respectful of API
         await new Promise(resolve => setTimeout(resolve, 1000));
 
       } catch (error) {
+        reprocessStats.failCount++;
         if (error.message?.includes('quota') || error.message?.includes('limit')) {
           console.log("⚠️ Rate limit hit during reprocessing, stopping for this cycle");
           break;
@@ -852,6 +877,8 @@ Return ONLY valid JSON:
         // Continue with next memory even if one fails
       }
     }
+
+    console.log(`📊 Reprocessing cycle complete: ${reprocessStats.successCount} succeeded, ${reprocessStats.failCount} failed, ${reprocessStats.remainingOffline} remaining`);
 
   } catch (error) {
     console.error("Background reprocessing error:", error);
@@ -869,5 +896,59 @@ setTimeout(() => {
   console.log("🚀 Starting background reprocessing worker...");
   reprocessOfflineMemories();
 }, 30000);
+
+// STATUS ENDPOINT - Check reprocessing progress
+router.get('/reprocess/status', async (req, res) => {
+  try {
+    const offlineCount = await Memory.countDocuments({
+      $or: [
+        { tags: { $regex: /^offline$/i } },
+        { tags: { $regex: /^auto-classified$/i } }
+      ]
+    });
+
+    const offlineMemories = await Memory.find({
+      $or: [
+        { tags: { $regex: /^offline$/i } },
+        { tags: { $regex: /^auto-classified$/i } }
+      ]
+    })
+      .select('text mood tags createdAt')
+      .sort({ createdAt: 1 })
+      .limit(20);
+
+    res.json({
+      isRunning: isReprocessing,
+      stats: reprocessStats,
+      offlineCount,
+      nextRunIn: isReprocessing ? 'Running now' : 'Within 5 minutes',
+      sampleOfflineMemories: offlineMemories.map(m => ({
+        id: m._id,
+        preview: m.text.substring(0, 60) + '...',
+        mood: m.mood,
+        tags: m.tags,
+        createdAt: m.createdAt
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Status check failed' });
+  }
+});
+
+// MANUAL TRIGGER - Force reprocessing now
+router.post('/reprocess/trigger', async (req, res) => {
+  try {
+    if (isReprocessing) {
+      return res.json({ message: 'Reprocessing already in progress' });
+    }
+    
+    // Run reprocessing immediately (don't await - let it run in background)
+    reprocessOfflineMemories();
+    
+    res.json({ message: 'Reprocessing triggered successfully' });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to trigger reprocessing' });
+  }
+});
 
 module.exports = router;
