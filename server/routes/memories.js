@@ -705,4 +705,169 @@ router.post('/:id/links', async (req, res) => {
   }
 });
 
+// BACKGROUND RE-CLASSIFICATION WORKER
+let isReprocessing = false;
+
+async function reprocessOfflineMemories() {
+  if (isReprocessing) {
+    console.log("⏳ Reprocessing already in progress, skipping...");
+    return;
+  }
+
+  try {
+    isReprocessing = true;
+    
+    // Find up to 10 memories that were auto-classified in offline mode
+    const offlineMemories = await Memory.find({ tags: 'offline' })
+      .sort({ createdAt: 1 }) // Oldest first
+      .limit(10);
+
+    if (!offlineMemories.length) {
+      console.log("✅ No offline memories to reprocess");
+      return;
+    }
+
+    console.log(`🔄 Found ${offlineMemories.length} offline memories to reprocess`);
+
+    for (const memory of offlineMemories) {
+      // Check rate limit before each memory
+      if (!checkRateLimit()) {
+        console.log("⚠️ Rate limit reached during reprocessing, will continue next cycle");
+        break;
+      }
+
+      try {
+        console.log(`🔄 Reprocessing: ${memory.text.substring(0, 40)}...`);
+
+        // Get existing families for context
+        const existingFamilies = await Memory.distinct('mood');
+
+        // Re-run AI classification
+        const prompt = `Analyze this personal story for emotional classification: "${memory.text}"
+
+${existingFamilies.length > 0 ? `
+EXISTING MOOD FAMILIES in the archive:
+${existingFamilies.map(f => `- ${f}`).join('\n')}
+
+First, check if this story fits into one of the EXISTING families above. Only create a NEW family name if:
+1. The story's emotion is distinctly different from all existing families
+2. The nuance cannot be captured by any existing family
+3. It represents a genuinely new emotional territory
+
+If it fits an existing family, use that exact name.
+` : `
+This is one of the first stories in the archive. Create an evocative mood family name.
+`}
+
+CLASSIFICATION GUIDELINES:
+- Mood family names should be poetic but clear (e.g., "Grief", "Quiet Joy", "Longing", "Relief")
+- Be specific enough to be meaningful but broad enough to hold multiple stories
+- Avoid overly narrow classifications that would only fit one story
+- Think about emotional resonance and thematic kinship
+
+Return ONLY valid JSON:
+{
+  "mood": "Family name (existing or new)",
+  "reasoning": "Brief explanation of why this family fits or why a new one was needed",
+  "tags": ["keyword1", "keyword2", "keyword3"],
+  "color": "#HEXCODE",
+  "themeVector": {
+    "emotionalCore": [{"label": "primary_emotion", "weight": 0.7}, {"label": "secondary_emotion", "weight": 0.3}],
+    "narrativeState": [{"label": "unfinished", "weight": 0.6}, {"label": "resolved", "weight": 0.4}],
+    "relationalFocus": [{"label": "self", "weight": 0.5}, {"label": "family", "weight": 0.5}],
+    "temporalOrientation": [{"label": "memory", "weight": 0.8}, {"label": "present", "weight": 0.2}],
+    "spatialIntimacy": [{"label": "private", "weight": 0.7}, {"label": "public", "weight": 0.3}]
+  }
+}`;
+
+        const result = await model.generateContent(prompt);
+        const rawText = result.response.text();
+        const jsonStr = cleanAIResponse(rawText);
+        const analysis = JSON.parse(jsonStr);
+
+        const normalized = normalizeAnalysis(analysis);
+        const themeVector = normalized.themeVector || normalizeThemeVector(analysis?.themeVector);
+        
+        // Re-generate embedding
+        const embedding = await embedText(memory.text);
+
+        // Perform clustering analysis
+        let finalMood = normalized.mood;
+        const sampleMemories = await Memory.find({ 
+          mood: { $in: existingFamilies },
+          _id: { $ne: memory._id } // Exclude current memory
+        })
+          .select('mood embedding themeVector tags')
+          .sort({ createdAt: -1 })
+          .limit(400);
+
+        if (sampleMemories.length > 0) {
+          const familyStats = buildFamilyStats(sampleMemories);
+          const candidate = { embedding, themeVector, tags: normalized.tags };
+          const scoredFamilies = familyStats
+            .map((family) => {
+              const scored = scoreFamilyMatch(candidate, family);
+              return { mood: family.mood, score: scored.score };
+            })
+            .sort((a, b) => b.score - a.score);
+
+          const best = scoredFamilies[0];
+          const hasEmbedding = isValidEmbedding(embedding) && best?.components?.hasEmbedding;
+          const threshold = hasEmbedding ? 0.62 : 0.52;
+
+          if (best && best.score >= threshold) {
+            finalMood = best.mood;
+          }
+        }
+
+        // Check if new family should be broadened
+        const isNewFamily = !existingFamilies.includes(finalMood);
+        if (isNewFamily) {
+          const broadened = await broadenMoodName(finalMood, existingFamilies);
+          if (broadened && broadened !== finalMood) {
+            finalMood = broadened;
+          }
+        }
+
+        // Update the memory
+        memory.mood = finalMood;
+        memory.tags = normalized.tags; // Remove 'offline' tag
+        memory.color = normalized.color;
+        memory.themeVector = themeVector;
+        memory.embedding = embedding;
+        
+        await memory.save();
+
+        console.log(`✅ Reprocessed → ${finalMood}`);
+
+        // Small delay between memories to be respectful of API
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+      } catch (error) {
+        if (error.message?.includes('quota') || error.message?.includes('limit')) {
+          console.log("⚠️ Rate limit hit during reprocessing, stopping for this cycle");
+          break;
+        }
+        console.error(`❌ Failed to reprocess memory ${memory._id}:`, error.message);
+        // Continue with next memory even if one fails
+      }
+    }
+
+  } catch (error) {
+    console.error("Background reprocessing error:", error);
+  } finally {
+    isReprocessing = false;
+  }
+}
+
+// Start background worker - runs every 5 minutes
+const REPROCESS_INTERVAL = 5 * 60 * 1000; // 5 minutes
+setInterval(reprocessOfflineMemories, REPROCESS_INTERVAL);
+
+// Run once on startup (after 30 seconds to let server fully initialize)
+setTimeout(() => {
+  console.log("🚀 Starting background reprocessing worker...");
+  reprocessOfflineMemories();
+}, 30000);
+
 module.exports = router;
